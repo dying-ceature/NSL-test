@@ -2,7 +2,9 @@ import numpy as np
 import torch
 import time
 import math
+
 torch.set_printoptions(8)
+
 
 def gelu(x):
     """
@@ -11,11 +13,11 @@ def gelu(x):
         online conversion website)
         Website: https://www.latexlive.com/
         Formula: \frac{1}{2} x\left[1+\tanh \left(\sqrt{\frac{2}{\pi}}\left(x+0.044715 x^{3}\right)\right)\right]
-        
+
         Input: Tensor
         Output: Tensor
     """
-    pass
+    return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
 
 
 def softmax(x):
@@ -24,44 +26,53 @@ def softmax(x):
         Input: Tensor
         Output: Tensor
     """
-    pass
+    x_exp = torch.exp(x)
+    return x_exp / torch.sum(x_exp, dim=-1, keepdim=True)
 
 
-def layer_norm(x, g_b, eps:float = 1e-5):
+def layer_norm(x, g_b, eps: float = 1e-5):
     """
         Task: Use torch API to implement `layernorm` function, search `layernorm` by yourself
-        Input: 
+        Input:
             x: Tensor
             g_b: dictionary that load from gpt2 weight. g-gamma and b-bias are the keys
         Output: Tensor
     """
     g, b = torch.Tensor(g_b['g']), torch.Tensor(g_b['b'])
-    
-    pass
+    mean = x.mean(dim=-1, keepdim=True)
+    std = torch.sqrt(x.var(dim=-1, unbiased=False, keepdim=True) + eps)
+    x_norm = (x - mean) / std;
+    return g * x_norm + b;
+
 
 def linear(x, w_b):  # [m, in], [in, out], [out] -> [m, out]
     """
-        Task: implement linear layer 
-        Input: 
+        Task: implement linear layer
+        Input:
             x: Tensor
             w_b: dictionary that load from gpt2 weight. w-weight and b-bias are the keys
         Output: Tensor
     """
     w, b = w_b['w'], w_b['b']
-    pass
-    
+    return x @ w + b
+
 
 def ffn(x, mlp):  # [n_seq, n_embd] -> [n_seq, n_embd]
     """
         Task: use `gelu` `linear` to implement ffn
         Notes: x --linear--> --gelu--> --linear--> output
-        Input: 
+        Input:
             x: Tensor
             mlp: dictionary that load from gpt2 weight. w_b1 and w_b2 are the params of two linear layer
         Output: Tensor
     """
     w_b1, w_b2 = mlp['c_fc'], mlp['c_proj']
-    pass
+
+    x = linear(x, w_b1)
+    x = gelu(x)
+    x = linear(x, w_b2)
+
+    return x
 
 
 def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] -> [n_q, d_v]
@@ -69,7 +80,7 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
         Task: use torch API to implement attention computation according to formula(1) of the following paper
               where d_k account for the last dimension of `k`
         Paper: https://arxiv.org/abs/1706.03762
-        Input: 
+        Input:
             q: Tensor
             k: Tensor
             v: Tensor
@@ -77,13 +88,23 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
             mlp: dictionary that load from gpt2 weight. w_b1 and w_b2 are the params of two linear layer
         Output: Tensor
     """
-    pass
+    # claculate scores
+    d_k = k.size(-1)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(d_k)
+
+    # apply mask
+    if mask is not None:
+        scores = scores + mask
+    attentions = softmax(scores)
+
+    return attentions @ v
+
 
 def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     """
         Task: Complete the code of the multi-head attention
-        
-        Input: 
+
+        Input:
             x: Tensor
             attn: dictionary that load from gpt2 weight. c_attn and c_proj are the params of two linear layer
             n_head: number of head
@@ -92,16 +113,18 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     c_attn, c_proj = attn['c_attn'], attn['c_proj']
     # qkv projection
     x = linear(x, c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]
-    
+
     # Split into qkv
     """
         Task: Split the q,k,v matrix from the tensor x
         Notes: [n_seq, 3*n_embd] -> 3 * [n_seq, n_embd]
     """
-    qkv = None # need to modify
+    q, k, v = x.chunk(3, dim=-1)
+    qkv = [q, k, v]
 
     # Split into heads
-    qkv_heads = [qkv_part.chunk(n_head, dim=-1) for qkv_part in qkv]  # 3 * [n_seq, n_embd] -> 3 * n_head * [n_seq, n_embd/n_head]
+    qkv_heads = [qkv_part.chunk(n_head, dim=-1) for qkv_part in
+                 qkv]  # 3 * [n_seq, n_embd] -> 3 * n_head * [n_seq, n_embd/n_head]
     qkv_heads = list(zip(*qkv_heads))  # [3, n_head, n_seq, n_embd/n_head]
 
     # Causal mask to hide future inputs from being attended to
@@ -115,27 +138,28 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             | 0    0    0  ...   0  |
         Mask is a tensor whose dimension is [n_seq, n_seq]
     """
-    causal_mask = None # need to modify
+    n_seq = x.size(0)
+    causal_mask = torch.triu(torch.full((n_seq, n_seq), float('-inf')), diagonal=1)
 
     # Perform attention over each head
     out_heads = [attention(q, k, v, causal_mask) for q, k, v in qkv_heads]  # n_head * [n_seq, n_embd/n_head]
-    
+
     # Merge heads
     """
         Task: merge multi-heads results
         Notes: n_head * [n_seq, n_embd/n_head] --> [n_seq, n_embd]
     """
-    x = None # need to modify
-    
+    x = torch.cat(out_heads, dim=-1)
+
     # Out projection
     x = linear(x, c_proj)  # [n_seq, n_embd] -> [n_seq, n_embd]
-    
+
     return x
 
 
 def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     mlp, attn, ln_1, ln_2 = block['mlp'], block['attn'], block['ln_1'], block['ln_2']
-    
+
     # multi-head causal self attention
     x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
@@ -149,7 +173,7 @@ def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
     # token + positional embeddings
     x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
-    
+
     x = torch.Tensor(x)
     # forward pass through n_layer transformer blocks
     for block in blocks:
@@ -168,13 +192,14 @@ def generate(inputs, params, n_head, n_tokens_to_generate):
         next_id = np.argmax(logits[-1])  # greedy sampling
         inputs.append(int(next_id))  # append prediction to input
 
-    return inputs[len(inputs) - n_tokens_to_generate :]  # only return generated ids
+    return inputs[len(inputs) - n_tokens_to_generate:]  # only return generated ids
 
-def greedy_speculative_generate(inputs, draft_params, target_params, hparams_draft, hparams_target, n_tokens_to_generate, K):
-    
+
+def greedy_speculative_generate(inputs, draft_params, target_params, hparams_draft, hparams_target,
+                                n_tokens_to_generate, K):
     """
         Task: Load 124M and 1558M models at the same time, use greedy sampling, and complete speculative decoding
-    
+
         Inputs:
             inputs (list): The initial list of token IDs from the prompt.
             draft_params, target_params: Model weights for the draft and target models.
@@ -184,7 +209,7 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
 
         Returns:
             list: A list of newly generated token IDs.
-            
+
     """
     generated_ids = []
     current_inputs = list(inputs)
@@ -220,4 +245,5 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
 
 if __name__ == "__main__":
     import fire
+
     fire.Fire(main)
