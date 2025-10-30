@@ -5,6 +5,7 @@ import math
 
 torch.set_printoptions(8)
 
+kv_cache = None
 
 def gelu(x):
     """
@@ -100,7 +101,7 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
     return attentions @ v
 
 
-def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def mha(x, attn, n_head, kv_cache=None):  # [n_seq, n_embd] -> [n_seq, n_embd]
     """
         Task: Complete the code of the multi-head attention
 
@@ -111,6 +112,7 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Output: Tensorying multi-head attention and linear transformation, shape [n_seq, n_embd].
     """
     c_attn, c_proj = attn['c_attn'], attn['c_proj']
+    n_seq, n_embed = x.shape
     # qkv projection
     x = linear(x, c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]
 
@@ -120,13 +122,16 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
         Notes: [n_seq, 3*n_embd] -> 3 * [n_seq, n_embd]
     """
     q, k, v = x.chunk(3, dim=-1)
-    qkv = [q, k, v]
+    head_dim = n_embed // n_head
+    q = q.view(n_seq, n_head, head_dim).transpose(0, 1)  ## [n_head, n_seq, head_dim]
+    k = k.view(n_seq, n_head, head_dim).transpose(0, 1)
+    v = v.view(n_seq, n_head, head_dim).transpose(0, 1)
 
-    # Split into heads
-    qkv_heads = [qkv_part.chunk(n_head, dim=-1) for qkv_part in
-                 qkv]  # 3 * [n_seq, n_embd] -> 3 * n_head * [n_seq, n_embd/n_head]
-    qkv_heads = list(zip(*qkv_heads))  # [3, n_head, n_seq, n_embd/n_head]
-
+    #cat cache
+    if kv_cache is not None and kv_cache['k'] is not None:
+        k = torch.cat([kv_cache['k'], k], dim=1)
+        v = torch.cat([kv_cache['v'], v], dim=1)
+    new_cache = {'k': k, 'v': v}
     # Causal mask to hide future inputs from being attended to
     """
         Task: Construct mask matrix
@@ -138,57 +143,77 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
             | 0    0    0  ...   0  |
         Mask is a tensor whose dimension is [n_seq, n_seq]
     """
-    n_seq = x.size(0)
-    causal_mask = torch.triu(torch.full((n_seq, n_seq), float('-inf')), diagonal=1)
-
+    total_len = k.size(1)
+    causal_mask = torch.triu(torch.full((total_len, total_len), float('-inf')), diagonal=1)
+    mask = causal_mask[-n_seq:, :]
     # Perform attention over each head
-    out_heads = [attention(q, k, v, causal_mask) for q, k, v in qkv_heads]  # n_head * [n_seq, n_embd/n_head]
-
+    out_heads = []  # n_head * [n_seq, n_embd/n_head]
+    for h in range(n_head):
+        out_h = attention(q[h], k[h], v[h], mask)
+        out_heads.append(out_h)
     # Merge heads
     """
         Task: merge multi-heads results
         Notes: n_head * [n_seq, n_embd/n_head] --> [n_seq, n_embd]
     """
-    x = torch.cat(out_heads, dim=-1)
+    out = torch.cat(out_heads, dim=-1)
 
     # Out projection
-    x = linear(x, c_proj)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    out = linear(out, c_proj)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
-    return x
+    return out, new_cache
 
 
-def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def transformer_block(x, block, n_head, kv_cache=None):  # [n_seq, n_embd] -> [n_seq, n_embd]
     mlp, attn, ln_1, ln_2 = block['mlp'], block['attn'], block['ln_1'], block['ln_2']
 
     # multi-head causal self attention
-    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    attn_out, new_cache = mha(layer_norm(x, ln_1), attn, n_head=n_head, kv_cache=kv_cache)
+    x = x + attn_out # [n_seq, n_embd] -> [n_seq, n_embd]
 
     # position-wise feed forward network
     x = x + ffn(layer_norm(x, ln_2), mlp)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
-    return x
+    return x, new_cache
 
 
-def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
+def gpt2(inputs, params, n_head, kv_cache=None):  # [n_seq] -> [n_seq, n_vocab]
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
+    is_first = kv_cache is None or kv_cache[0]['k'] is None
+    if is_first:
+        start = 0
+        new_tokens = inputs
+    else:
+        start = kv_cache[0]['k'].size(1)
+        new_tokens = inputs[-1:]
+
+    pos = range(start, start + len(new_tokens))
     # token + positional embeddings
-    x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
+    x = wte[new_tokens] + wpe[pos]  # [n_seq] -> [n_seq, n_embd]
 
     x = torch.Tensor(x)
     # forward pass through n_layer transformer blocks
-    for block in blocks:
-        x = transformer_block(x, block, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
-
+    for i, block in enumerate(blocks):
+        if kv_cache is None:
+            current_cache = None
+        else:
+            current_cache = kv_cache[i]
+        x, new_cache = transformer_block(x, block, n_head=n_head, kv_cache=current_cache)  # [n_seq, n_embd] -> [n_seq, n_embd]
+        if kv_cache is not None:
+            kv_cache[i] = new_cache
     # projection to vocab
     x = layer_norm(x, ln_f)  # [n_seq, n_embd] -> [n_seq, n_embd]
     return x @ wte.T  # [n_seq, n_embd] -> [n_seq, n_vocab]
 
 
 def generate(inputs, params, n_head, n_tokens_to_generate):
+    global kv_cache
+    kv_cache = [{'k': None, 'v': None} for _ in range(len(params['blocks']))]
+
     from tqdm import tqdm
 
     for _ in tqdm(range(n_tokens_to_generate), "generating"):  # auto-regressive decode loop
-        logits = gpt2(inputs, params, n_head=n_head)  # model forward pass
+        logits = gpt2(inputs, params, n_head=n_head, kv_cache=kv_cache)  # model forward pass
         next_id = np.argmax(logits[-1])  # greedy sampling
         inputs.append(int(next_id))  # append prediction to input
 
@@ -220,7 +245,7 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
     return generated_ids
 
 
-def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", models_dir: str = "models"):
+def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "1558M", models_dir: str = "models"):
     from utils import load_encoder_hparams_and_params
 
     # load encoder, hparams, and params from the released open-ai gpt-2 files
