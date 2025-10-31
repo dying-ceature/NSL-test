@@ -219,6 +219,26 @@ def generate(inputs, params, n_head, n_tokens_to_generate):
 
     return inputs[len(inputs) - n_tokens_to_generate:]  # only return generated ids
 
+###-------------------###
+import copy
+
+def argmax_from_logits(logits):
+    return int(torch.argmax(logits[-1]))
+
+
+def generate_k_by_draft(current_inputs, draft_params, hparams_draft, kv_draft, K):
+    temp_kv = copy.deepcopy(kv_draft)
+    temp_inputs = list(current_inputs)
+    candidates = []
+
+    # generate K tokens by draft model
+    for _ in range(K):
+        logits = gpt2(temp_inputs, draft_params, hparams_draft['n_head'], kv_cache=temp_kv)
+        next_id = argmax_from_logits(logits)
+        candidates.append(next_id)
+        temp_inputs.append(next_id)
+
+    return candidates, temp_kv
 
 def greedy_speculative_generate(inputs, draft_params, target_params, hparams_draft, hparams_target,
                                 n_tokens_to_generate, K):
@@ -239,9 +259,38 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
     generated_ids = []
     current_inputs = list(inputs)
 
-    while len(generated_ids) < n_tokens_to_generate:
-        pass
+    kv_draft = [{'k': None, 'v': None} for _ in range(len(draft_params['blocks']))]
+    kv_target = [{'k': None, 'v': None} for _ in range(len(target_params['blocks']))]
 
+
+    while len(generated_ids) < n_tokens_to_generate:
+        candidates, temp_kv_after_K = generate_k_by_draft(current_inputs, draft_params, hparams_draft, kv_draft, K)
+        rejected = False
+        for j, cand_token in enumerate(candidates):
+            logits = gpt2(current_inputs, target_params, hparams_target['n_head'], kv_cache=kv_target)
+            target_argmax = argmax_from_logits(logits)
+
+            if target_argmax == cand_token:
+                generated_ids.append(cand_token)
+                current_inputs.append(cand_token)
+
+                _ = gpt2([cand_token], draft_params, hparams_draft['n_head'], kv_cache=kv_draft)
+
+                if len(generated_ids) >= n_tokens_to_generate:
+                    break
+            else:
+                generated_ids.append(target_argmax)
+                current_inputs.append(target_argmax)
+
+                while len(generated_ids) < n_tokens_to_generate:
+                    logits_next = gpt2(current_inputs, target_params, hparams_target['n_head'], kv_cache=kv_target)
+                    next_id = argmax_from_logits((logits_next))
+                    generated_ids.append(next_id)
+                    current_inputs.append(next_id)
+                rejected = True
+                break
+        if rejected:
+            break;
     return generated_ids
 
 
@@ -249,17 +298,29 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "1558M", 
     from utils import load_encoder_hparams_and_params
 
     # load encoder, hparams, and params from the released open-ai gpt-2 files
-    encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
+    encoder, hparams_target, params_target = load_encoder_hparams_and_params(model_size, models_dir)
+
+    # load draft (small) model: 124M
+    _, hparams_draft, params_draft = load_encoder_hparams_and_params("124M", models_dir)
 
     # encode the input string using the BPE tokenizer
     input_ids = encoder.encode(prompt)
 
     # make sure we are not surpassing the max sequence length of our model
-    assert len(input_ids) + n_tokens_to_generate < hparams["n_ctx"]
+    assert len(input_ids) + n_tokens_to_generate < hparams_target["n_ctx"]
 
     # generate output ids
     start = time.time()
-    output_ids = generate(input_ids, params, hparams["n_head"], n_tokens_to_generate)
+    K = 4
+    output_ids = greedy_speculative_generate(
+        inputs=input_ids,
+        draft_params=params_draft,
+        target_params=params_target,
+        hparams_draft=hparams_draft,
+        hparams_target=hparams_target,
+        n_tokens_to_generate=n_tokens_to_generate,
+        K=K
+    )
     end = time.time()
     print(f"Time taken to generate {n_tokens_to_generate} tokens: {end - start:.2f}s")
 
