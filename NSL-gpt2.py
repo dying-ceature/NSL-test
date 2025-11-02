@@ -96,6 +96,7 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
     # apply mask
     if mask is not None:
         scores = scores + mask
+
     attentions = softmax(scores)
 
     return attentions @ v
@@ -282,15 +283,11 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
                 generated_ids.append(target_argmax)
                 current_inputs.append(target_argmax)
 
-                while len(generated_ids) < n_tokens_to_generate:
-                    logits_next = gpt2(current_inputs, target_params, hparams_target['n_head'], kv_cache=kv_target)
-                    next_id = argmax_from_logits((logits_next))
-                    generated_ids.append(next_id)
-                    current_inputs.append(next_id)
+
                 rejected = True
                 break
         if rejected:
-            break;
+            continue
     return generated_ids
 
 
