@@ -241,6 +241,20 @@ def generate_k_by_draft(current_inputs, draft_params, hparams_draft, kv_draft, K
 
     return candidates, temp_kv
 
+def rollback_kv_cache(kv_cache, valid_steps):
+    new_cache = []
+    for layer in kv_cache:
+        k, v = layer["k"], layer["v"]
+        if k is not None:
+            new_layer = {
+                "k": k[:, :valid_steps, :],
+                "v": v[:, :valid_steps, :],
+            }
+        else:
+            new_layer = {"k": None, "v": None}
+        new_cache.append(new_layer)
+    return new_cache
+
 def greedy_speculative_generate(inputs, draft_params, target_params, hparams_draft, hparams_target,
                                 n_tokens_to_generate, K):
     """
@@ -280,9 +294,9 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
                 if len(generated_ids) >= n_tokens_to_generate:
                     break
             else:
+                kv_draft = rollback_kv_cache(kv_draft, len(current_inputs))
                 generated_ids.append(target_argmax)
                 current_inputs.append(target_argmax)
-
 
                 rejected = True
                 break
